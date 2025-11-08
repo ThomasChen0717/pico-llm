@@ -255,11 +255,19 @@ def _get_token_embedding_weight(model):
     """
     Return an (vocab_size, d_model) embedding matrix if the model has one.
     """
+    
+    # Check if the model has an attribute named embedding
     if hasattr(model, "embedding") and isinstance(model.embedding, nn.Embedding):
         return model.embedding.weight
+
+    # If the model doesn't directly store the embedding as model.embedding, 
+    # we still scan through all submodules to find any nn.Embedding layer 
+    # and return its weights.
     for m in model.modules():
         if isinstance(m, nn.Embedding):
             return m.weight
+
+    #If no embedding is found (like in the K-gram MLP, which doesn’t use embeddings)
     return None 
 
 def _cosine_topk_rows(mat, row_vec, top_k):
@@ -267,10 +275,23 @@ def _cosine_topk_rows(mat, row_vec, top_k):
     mat: (N, D), row_vec: (D,)
     returns: list[(cos_sim, idx)] of length top_k sorted desc
     """
+    #Normalize the each embedding vector in the matrix to unit length
+    #1e-8 to avoid division by 0
     mat_norm = mat / (mat.norm(dim=1, keepdim=True) + 1e-8)
+
+    #Normalize the target token’s embedding
     v = row_vec / (row_vec.norm() + 1e-8)
+
+    #Compute cosine similarity between the normalized matrix rows and the normalized token vector.
+    #Result: tensor of shape (N,), one similarity per token in the vocabulary.
     sims = (mat_norm @ v)  
+
+    #Find the top-k most similar tokens.
+    # values = cosine similarities
+    # indices = token IDs (row indices) of the most similar embeddings.
     values, indices = torch.topk(sims, k=top_k)
+
+    # Return a Python list of tuples (similarity, token_index).
     return [(values[i].item(), indices[i].item()) for i in range(values.numel())]
 
 @torch.no_grad()
@@ -280,18 +301,29 @@ def monosemantic_analysis_for_token(token_id, model, device="cpu", top_n=5):
     Output: list of tuples (similarity, neighbor_token_id).
     If the model has no embedding (e.g., K-gram MLP), return [].
     """
+    #Get the embedding weight matrix
     W = _get_token_embedding_weight(model)
+    #Failsafe: if the model has no embedding, return []
     if W is None:
         return [] 
 
+    #Move the embedding matrix to the correct device
     W = W.to(device)
+
+    # Sanity-check that the token_id is valid.
     token_id = int(token_id)
     if token_id < 0 or token_id >= W.size(0):
         return []
 
+    # Extract that token’s embedding vector (shape (embedding_dim,))
     v = W[token_id] 
+
+    # Compute cosine similarities between this token’s embedding and all others.
+    #Ask for one extra (top_n + 1) so we can later remove the token itself.
     top_pairs = _cosine_topk_rows(W, v, top_k=min(top_n + 1, W.size(0)))
 
+    # Build the result list by skipping the token itself (similarity = 1 with itself).
+    #Keep adding until you collect exactly top_n neighbors.
     result = []
     for sim, idx in top_pairs:
         if idx == token_id:
@@ -299,6 +331,8 @@ def monosemantic_analysis_for_token(token_id, model, device="cpu", top_n=5):
         result.append((sim, idx))
         if len(result) >= top_n:
             break
+    
+    # Return a list of (similarity_score, neighbor_token_id) tuples.
     return result
 
 
