@@ -250,10 +250,56 @@ class TransformerModel(nn.Module):
 ################################################################################
 # 6. K-Means Monosemantic (DISABLED by default)
 ################################################################################
+#Helpers 
+def _get_token_embedding_weight(model):
+    """
+    Return an (vocab_size, d_model) embedding matrix if the model has one.
+    """
+    if hasattr(model, "embedding") and isinstance(model.embedding, nn.Embedding):
+        return model.embedding.weight
+    for m in model.modules():
+        if isinstance(m, nn.Embedding):
+            return m.weight
+    return None 
 
+def _cosine_topk_rows(mat, row_vec, top_k):
+    """
+    mat: (N, D), row_vec: (D,)
+    returns: list[(cos_sim, idx)] of length top_k sorted desc
+    """
+    mat_norm = mat / (mat.norm(dim=1, keepdim=True) + 1e-8)
+    v = row_vec / (row_vec.norm() + 1e-8)
+    sims = (mat_norm @ v)  
+    values, indices = torch.topk(sims, k=top_k)
+    return [(values[i].item(), indices[i].item()) for i in range(values.numel())]
 
-def monosemantic_analysis_for_token(token_id, model, enc, device="cpu", top_n=5):
-    return []
+@torch.no_grad()
+def monosemantic_analysis_for_token(token_id, model, device="cpu", top_n=5):
+    """
+    Return top-N nearest neighbors of token_id in embedding space.
+    Output: list of tuples (similarity, neighbor_token_id).
+    If the model has no embedding (e.g., K-gram MLP), return [].
+    """
+    W = _get_token_embedding_weight(model)
+    if W is None:
+        return [] 
+
+    W = W.to(device)
+    token_id = int(token_id)
+    if token_id < 0 or token_id >= W.size(0):
+        return []
+
+    v = W[token_id] 
+    top_pairs = _cosine_topk_rows(W, v, top_k=min(top_n + 1, W.size(0)))
+
+    result = []
+    for sim, idx in top_pairs:
+        if idx == token_id:
+            continue
+        result.append((sim, idx))
+        if len(result) >= top_n:
+            break
+    return result
 
 
 ################################################################################
@@ -297,7 +343,7 @@ def generate_text(model, enc, init_text, max_new_tokens=20, device="cpu",
 
             if do_monosemantic and monosemantic_info is not None:
                 neighbors = monosemantic_analysis_for_token(
-                    chosen_token, model, monosemantic_info, enc, device=device, top_n=5
+                    chosen_token, model, device=device, top_n=5
                 )
                 annotation_list.append((chosen_token, neighbors))
             else:
@@ -544,6 +590,9 @@ def main():
     }
 
 
+    monosemantic_info = {} if args.monosemantic_enabled else None
+
+
     ############################################################################
     # Train each model
     ############################################################################
@@ -560,6 +609,7 @@ def main():
             sample_interval=sample_interval_seconds,
             max_steps_per_epoch=max_steps_per_epoch,
             enc=enc,
+            monosemantic_info=monosemantic_info,
             prompt=args.prompt  # <--- Pass the user-specified prompt here
         )
 
@@ -568,16 +618,22 @@ def main():
             # 1) Greedy
             text_greedy, ann_greedy = generate_text(
                 model, enc, args.prompt, max_new_tokens=20, device=device,
+                monosemantic_info=monosemantic_info,
+                do_monosemantic=(monosemantic_info is not None),
                 top_p=None,
             )
             # 2) top-p=0.95
             text_topp, ann_topp = generate_text(
                 model, enc, args.prompt, max_new_tokens=20, device=device,
+                monosemantic_info=monosemantic_info,
+                do_monosemantic=(monosemantic_info is not None),
                 top_p=0.95,
             )
             # 3) top-p=1.0 => full distribution random sampling
             text_topp1, ann_topp1 = generate_text(
                 model, enc, args.prompt, max_new_tokens=20, device=device,
+                monosemantic_info=monosemantic_info,
+                do_monosemantic=(monosemantic_info is not None),
                 top_p=1.0,
             )
 
