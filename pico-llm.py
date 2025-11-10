@@ -335,6 +335,134 @@ def monosemantic_analysis_for_token(token_id, model, device="cpu", top_n=5):
     # Return a list of (similarity_score, neighbor_token_id) tuples.
     return result
 
+def visualize_embeddings(model, sample_token_ids=None, max_points=800, title="Embedding PCA", savepath=None, device="cpu"):
+    """
+    Projects token embeddings to 2D with PCA (torch-only) and returns (coords_2d, used_token_ids).
+    If matplotlib is available in your env, you can also scatter-plot and save.
+    """
+    W = _get_token_embedding_weight(model)
+    if W is None:
+        print("[viz] No embedding found on this model.")
+        return None, None
+
+    W = W.to(device)
+    vocab_size = W.size(0)
+
+    if sample_token_ids is None:
+        if vocab_size > max_points:
+            idx = torch.randperm(vocab_size, device=device)[:max_points]
+        else:
+            idx = torch.arange(vocab_size, device=device)
+    else:
+        idx = torch.tensor(sample_token_ids, dtype=torch.long, device=device)
+        idx = idx[(idx >= 0) & (idx < vocab_size)]
+        if idx.numel() == 0:
+            print("[viz] Provided sample_token_ids are empty/invalid.")
+            return None, None
+
+    X = W[idx]  
+    
+    Xc = X - X.mean(dim=0, keepdim=True)
+
+    U, S, Vh = torch.linalg.svd(Xc, full_matrices=False)
+    Z = U[:, :2] * S[:2]  
+
+    try:
+        import matplotlib.pyplot as plt
+        plt.figure()
+        plt.scatter(Z[:, 0].cpu(), Z[:, 1].cpu(), s=4)
+        plt.title(title)
+        plt.xlabel("PC1")
+        plt.ylabel("PC2")
+        if savepath is not None:
+            plt.savefig(savepath, bbox_inches="tight", dpi=150)
+            print(f"[viz] Saved embedding PCA to {savepath}")
+        plt.close()
+    except Exception as e:
+        print(f"[viz] Skipped plotting ({e})")
+
+    return Z.detach().cpu(), idx.detach().cpu().tolist()
+
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+@torch.no_grad()
+def evaluate_loss_and_ppl(model, loader, device):
+    model.eval()
+    total_loss = 0.0
+    total_batches = 0
+    for batch_tokens in loader:
+        batch_tokens = batch_tokens.to(device)
+        logits = model(batch_tokens)
+        loss = compute_next_token_loss(logits, batch_tokens)
+        total_loss += loss.item()
+        total_batches += 1
+        if total_batches >= 50:   # cap for speed; tweak as needed
+            break
+    avg_loss = total_loss / max(total_batches, 1)
+    ppl = math.exp(avg_loss) if avg_loss < 20 else float("inf")
+    return avg_loss, ppl
+
+def compare_models(models_dict, loader, device, title="Model Comparison", savepath=None):
+    """
+    Returns a summary dict and saves a bar chart of perplexities.
+    """
+    summary = {}
+    names, ppls = [], []
+    for name, model in models_dict.items():
+        avg_loss, ppl = evaluate_loss_and_ppl(model, loader, device)
+        n_params = count_parameters(model)
+        summary[name] = {
+            "avg_loss": avg_loss,
+            "perplexity": ppl,
+            "params": n_params,
+        }
+        names.append(name)
+        ppls.append(ppl)
+
+    try:
+        import matplotlib.pyplot as plt
+        plt.figure()
+        plt.bar(names, ppls)
+        plt.title(title)
+        plt.ylabel("Perplexity (lower is better)")
+        plt.xticks(rotation=15)
+        if savepath is not None:
+            plt.savefig(savepath, bbox_inches="tight", dpi=150)
+            print(f"[compare] Saved chart to {savepath}")
+        plt.close()
+    except Exception as e:
+        print(f"[compare] Skipped plotting ({e})")
+
+    print("\n=== Model Comparison ===")
+    for k, v in summary.items():
+        print(f"{k:>16} | loss={v['avg_loss']:.4f} | ppl={v['perplexity']:.2f} | params={v['params']:,}")
+    print("========================\n")
+
+    return summary
+
+def plot_attention_heatmap(attn_matrix, title="Attention", savepath=None):
+    """
+    attn_matrix: (T, T) or (H, T, T) torch tensor
+    """
+    try:
+        import matplotlib.pyplot as plt
+        A = attn_matrix.detach().float().cpu()
+        if A.dim() == 3:
+            # Show first head by default
+            A = A[0]
+        plt.figure()
+        plt.imshow(A, aspect="auto")
+        plt.title(title)
+        plt.xlabel("Key positions")
+        plt.ylabel("Query positions")
+        if savepath:
+            plt.savefig(savepath, bbox_inches="tight", dpi=150)
+            print(f"[attn] Saved attention heatmap to {savepath}")
+        plt.close()
+    except Exception as e:
+        print(f"[attn] Skipped plotting ({e})")
+
 
 ################################################################################
 # 7. Single code path for text generation
