@@ -250,10 +250,218 @@ class TransformerModel(nn.Module):
 ################################################################################
 # 6. K-Means Monosemantic (DISABLED by default)
 ################################################################################
+#Helpers 
+def _get_token_embedding_weight(model):
+    """
+    Return an (vocab_size, d_model) embedding matrix if the model has one.
+    """
+    
+    # Check if the model has an attribute named embedding
+    if hasattr(model, "embedding") and isinstance(model.embedding, nn.Embedding):
+        return model.embedding.weight
 
+    # If the model doesn't directly store the embedding as model.embedding, 
+    # we still scan through all submodules to find any nn.Embedding layer 
+    # and return its weights.
+    for m in model.modules():
+        if isinstance(m, nn.Embedding):
+            return m.weight
 
-def monosemantic_analysis_for_token(token_id, model, enc, device="cpu", top_n=5):
-    return []
+    #If no embedding is found (like in the K-gram MLP, which doesn’t use embeddings)
+    return None 
+
+def _cosine_topk_rows(mat, row_vec, top_k):
+    """
+    mat: (N, D), row_vec: (D,)
+    returns: list[(cos_sim, idx)] of length top_k sorted desc
+    """
+    #Normalize the each embedding vector in the matrix to unit length
+    #1e-8 to avoid division by 0
+    mat_norm = mat / (mat.norm(dim=1, keepdim=True) + 1e-8)
+
+    #Normalize the target token’s embedding
+    v = row_vec / (row_vec.norm() + 1e-8)
+
+    #Compute cosine similarity between the normalized matrix rows and the normalized token vector.
+    #Result: tensor of shape (N,), one similarity per token in the vocabulary.
+    sims = (mat_norm @ v)  
+
+    #Find the top-k most similar tokens.
+    # values = cosine similarities
+    # indices = token IDs (row indices) of the most similar embeddings.
+    values, indices = torch.topk(sims, k=top_k)
+
+    # Return a Python list of tuples (similarity, token_index).
+    return [(values[i].item(), indices[i].item()) for i in range(values.numel())]
+
+@torch.no_grad()
+def monosemantic_analysis_for_token(token_id, model, device="cpu", top_n=5):
+    """
+    Return top-N nearest neighbors of token_id in embedding space.
+    Output: list of tuples (similarity, neighbor_token_id).
+    If the model has no embedding (e.g., K-gram MLP), return [].
+    """
+    #Get the embedding weight matrix
+    W = _get_token_embedding_weight(model)
+    #Failsafe: if the model has no embedding, return []
+    if W is None:
+        return [] 
+
+    #Move the embedding matrix to the correct device
+    W = W.to(device)
+
+    # Sanity-check that the token_id is valid.
+    token_id = int(token_id)
+    if token_id < 0 or token_id >= W.size(0):
+        return []
+
+    # Extract that token’s embedding vector (shape (embedding_dim,))
+    v = W[token_id] 
+
+    # Compute cosine similarities between this token’s embedding and all others.
+    #Ask for one extra (top_n + 1) so we can later remove the token itself.
+    top_pairs = _cosine_topk_rows(W, v, top_k=min(top_n + 1, W.size(0)))
+
+    # Build the result list by skipping the token itself (similarity = 1 with itself).
+    #Keep adding until you collect exactly top_n neighbors.
+    result = []
+    for sim, idx in top_pairs:
+        if idx == token_id:
+            continue
+        result.append((sim, idx))
+        if len(result) >= top_n:
+            break
+    
+    # Return a list of (similarity_score, neighbor_token_id) tuples.
+    return result
+
+def visualize_embeddings(model, sample_token_ids=None, max_points=800, title="Embedding PCA", savepath=None, device="cpu"):
+    """
+    Projects token embeddings to 2D with PCA (torch-only) and returns (coords_2d, used_token_ids).
+    If matplotlib is available in your env, you can also scatter-plot and save.
+    """
+    W = _get_token_embedding_weight(model)
+    if W is None:
+        print("[viz] No embedding found on this model.")
+        return None, None
+
+    W = W.to(device)
+    vocab_size = W.size(0)
+
+    if sample_token_ids is None:
+        if vocab_size > max_points:
+            idx = torch.randperm(vocab_size, device=device)[:max_points]
+        else:
+            idx = torch.arange(vocab_size, device=device)
+    else:
+        idx = torch.tensor(sample_token_ids, dtype=torch.long, device=device)
+        idx = idx[(idx >= 0) & (idx < vocab_size)]
+        if idx.numel() == 0:
+            print("[viz] Provided sample_token_ids are empty/invalid.")
+            return None, None
+
+    X = W[idx]  
+    
+    Xc = X - X.mean(dim=0, keepdim=True)
+
+    U, S, Vh = torch.linalg.svd(Xc, full_matrices=False)
+    Z = U[:, :2] * S[:2]  
+
+    try:
+        import matplotlib.pyplot as plt
+        plt.figure()
+        plt.scatter(Z[:, 0].cpu(), Z[:, 1].cpu(), s=4)
+        plt.title(title)
+        plt.xlabel("PC1")
+        plt.ylabel("PC2")
+        if savepath is not None:
+            plt.savefig(savepath, bbox_inches="tight", dpi=150)
+            print(f"[viz] Saved embedding PCA to {savepath}")
+        plt.close()
+    except Exception as e:
+        print(f"[viz] Skipped plotting ({e})")
+
+    return Z.detach().cpu(), idx.detach().cpu().tolist()
+
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+@torch.no_grad()
+def evaluate_loss_and_ppl(model, loader, device):
+    model.eval()
+    total_loss = 0.0
+    total_batches = 0
+    for batch_tokens in loader:
+        batch_tokens = batch_tokens.to(device)
+        logits = model(batch_tokens)
+        loss = compute_next_token_loss(logits, batch_tokens)
+        total_loss += loss.item()
+        total_batches += 1
+        if total_batches >= 50:   # cap for speed; tweak as needed
+            break
+    avg_loss = total_loss / max(total_batches, 1)
+    ppl = math.exp(avg_loss) if avg_loss < 20 else float("inf")
+    return avg_loss, ppl
+
+def compare_models(models_dict, loader, device, title="Model Comparison", savepath=None):
+    """
+    Returns a summary dict and saves a bar chart of perplexities.
+    """
+    summary = {}
+    names, ppls = [], []
+    for name, model in models_dict.items():
+        avg_loss, ppl = evaluate_loss_and_ppl(model, loader, device)
+        n_params = count_parameters(model)
+        summary[name] = {
+            "avg_loss": avg_loss,
+            "perplexity": ppl,
+            "params": n_params,
+        }
+        names.append(name)
+        ppls.append(ppl)
+
+    try:
+        import matplotlib.pyplot as plt
+        plt.figure()
+        plt.bar(names, ppls)
+        plt.title(title)
+        plt.ylabel("Perplexity (lower is better)")
+        plt.xticks(rotation=15)
+        if savepath is not None:
+            plt.savefig(savepath, bbox_inches="tight", dpi=150)
+            print(f"[compare] Saved chart to {savepath}")
+        plt.close()
+    except Exception as e:
+        print(f"[compare] Skipped plotting ({e})")
+
+    print("\n=== Model Comparison ===")
+    for k, v in summary.items():
+        print(f"{k:>16} | loss={v['avg_loss']:.4f} | ppl={v['perplexity']:.2f} | params={v['params']:,}")
+    print("========================\n")
+
+    return summary
+
+def plot_attention_heatmap(attn_matrix, title="Attention", savepath=None):
+    """
+    attn_matrix: (T, T) or (H, T, T) torch tensor
+    """
+    try:
+        import matplotlib.pyplot as plt
+        A = attn_matrix.detach().float().cpu()
+        if A.dim() == 3:
+            # Show first head by default
+            A = A[0]
+        plt.figure()
+        plt.imshow(A, aspect="auto")
+        plt.title(title)
+        plt.xlabel("Key positions")
+        plt.ylabel("Query positions")
+        if savepath:
+            plt.savefig(savepath, bbox_inches="tight", dpi=150)
+            print(f"[attn] Saved attention heatmap to {savepath}")
+        plt.close()
+    except Exception as e:
+        print(f"[attn] Skipped plotting ({e})")
 
 
 ################################################################################
@@ -297,7 +505,7 @@ def generate_text(model, enc, init_text, max_new_tokens=20, device="cpu",
 
             if do_monosemantic and monosemantic_info is not None:
                 neighbors = monosemantic_analysis_for_token(
-                    chosen_token, model, monosemantic_info, enc, device=device, top_n=5
+                    chosen_token, model, device=device, top_n=5
                 )
                 annotation_list.append((chosen_token, neighbors))
             else:
@@ -544,6 +752,9 @@ def main():
     }
 
 
+    monosemantic_info = {} if args.monosemantic_enabled else None
+
+
     ############################################################################
     # Train each model
     ############################################################################
@@ -560,6 +771,7 @@ def main():
             sample_interval=sample_interval_seconds,
             max_steps_per_epoch=max_steps_per_epoch,
             enc=enc,
+            monosemantic_info=monosemantic_info,
             prompt=args.prompt  # <--- Pass the user-specified prompt here
         )
 
@@ -568,16 +780,22 @@ def main():
             # 1) Greedy
             text_greedy, ann_greedy = generate_text(
                 model, enc, args.prompt, max_new_tokens=20, device=device,
+                monosemantic_info=monosemantic_info,
+                do_monosemantic=(monosemantic_info is not None),
                 top_p=None,
             )
             # 2) top-p=0.95
             text_topp, ann_topp = generate_text(
                 model, enc, args.prompt, max_new_tokens=20, device=device,
+                monosemantic_info=monosemantic_info,
+                do_monosemantic=(monosemantic_info is not None),
                 top_p=0.95,
             )
             # 3) top-p=1.0 => full distribution random sampling
             text_topp1, ann_topp1 = generate_text(
                 model, enc, args.prompt, max_new_tokens=20, device=device,
+                monosemantic_info=monosemantic_info,
+                do_monosemantic=(monosemantic_info is not None),
                 top_p=1.0,
             )
 
