@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
+import matplotlib.pyplot as plt
 
 # We do not import numpy or scikit-learn, so we implement a naive k-means in pure PyTorch.
 # If you prefer scikit-learn, you can adapt the code.
@@ -208,26 +209,443 @@ class KGramMLPSeqModel(nn.Module):
 ################################################################################
 
 class LSTMSeqModel(nn.Module):
-    def __init__(self, vocab_size, embed_size=1024, hidden_size=1024):
+    def __init__(self, vocab_size, embed_size=1024, hidden_size=1024, 
+                 num_layers=1, dropout=0.0, bidirectional=False):
+        """
+        Args:
+            vocab_size (int): Size of vocabulary
+            embed_size (int): Embedding dimension
+            hidden_size (int): LSTM hidden dimension
+            num_layers (int): Number of stacked LSTM layers (default: 1)
+            dropout (float): Dropout between LSTM layers (default: 0.0)
+            bidirectional (bool): Bidirectional LSTM (default: False)
+        """
         super().__init__()
         self.vocab_size = vocab_size
         self.embed_size = embed_size
         self.hidden_size = hidden_size
-
+        self.num_layers = num_layers
+        self.bidirectional = bidirectional
+        
+        # Embedding layer
         self.embedding = nn.Embedding(vocab_size, embed_size)
-        self.lstm = nn.LSTM(embed_size, hidden_size, batch_first=False)
-        self.linear = nn.Linear(hidden_size, vocab_size)
-
+        
+        # Multi-layer LSTM with optional dropout and bidirectional
+        self.lstm = nn.LSTM(
+            input_size=embed_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout if num_layers > 1 else 0.0,  # Dropout only works with > 1 layer
+            bidirectional=bidirectional,
+            batch_first=False
+        )
+        
+        # Output layer
+        # If bidirectional, LSTM output size is doubled
+        lstm_output_size = hidden_size * 2 if bidirectional else hidden_size
+        self.linear = nn.Linear(lstm_output_size, vocab_size)
+    
     def forward(self, tokens_seq):
         """
-        tokens_seq: (seq_len, batch)
-        => (seq_len, batch, vocab_size)
+        Forward pass
+        
+        Args:
+            tokens_seq: (seq_len, batch) - Input token IDs
+        
+        Returns:
+            logits: (seq_len, batch, vocab_size) - Output logits
         """
-        emb = self.embedding(tokens_seq)   # (seq_len, batch, embed)
+        # Embedding: (seq_len, batch) -> (seq_len, batch, embed_size)
+        emb = self.embedding(tokens_seq)
+        
+        # LSTM: (seq_len, batch, embed_size) -> (seq_len, batch, hidden_size * num_directions)
         self.lstm.flatten_parameters()
-        out, _ = self.lstm(emb)           # (seq_len, batch, hidden)
-        logits = self.linear(out)         # (seq_len, batch, vocab_size)
+        out, _ = self.lstm(emb)
+        
+        # Linear: (seq_len, batch, hidden * directions) -> (seq_len, batch, vocab_size)
+        logits = self.linear(out)
+        
         return logits
+
+def create_train_val_split(dataset, val_ratio=0.1, seed=42):
+    """
+    Split dataset into training and validation sets
+    
+    Args:
+        dataset: torch.utils.data.Dataset
+        val_ratio (float): Ratio of validation data (default: 0.1)
+        seed (int): Random seed for reproducibility
+    
+    Returns:
+        tuple: (train_dataset, val_dataset)
+    
+    Example:
+        >>> train_data, val_data = create_train_val_split(dataset, val_ratio=0.1)
+        >>> print(f"Train size: {len(train_data)}, Val size: {len(val_data)}")
+    """
+    total_size = len(dataset)
+    val_size = int(total_size * val_ratio)
+    train_size = total_size - val_size
+    
+    # Split with fixed seed for reproducibility
+    train_dataset, val_dataset = random_split(
+        dataset, 
+        [train_size, val_size],
+        generator=torch.Generator().manual_seed(seed)
+    )
+    
+    print(f"Dataset split: {train_size} train, {val_size} val")
+    
+    return train_dataset, val_dataset
+
+
+def setup_optimizer_and_scheduler(model, lr=1e-3, patience=3, factor=0.5, min_lr=1e-6):
+    """
+    Setup Adam optimizer and ReduceLROnPlateau scheduler
+    
+    The scheduler reduces learning rate when validation loss plateaus
+    
+    Args:
+        model: Neural network model
+        lr (float): Initial learning rate (default: 1e-3)
+        patience (int): Epochs with no improvement before LR reduction (default: 3)
+        factor (float): Factor to multiply LR by when reducing (default: 0.5)
+        min_lr (float): Minimum learning rate (default: 1e-6)
+    
+    Returns:
+        tuple: (optimizer, scheduler)
+    
+    Example:
+        >>> optimizer, scheduler = setup_optimizer_and_scheduler(model)
+        >>> # After each epoch:
+        >>> scheduler.step(val_loss)
+    """
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode='min',           # Minimize validation loss
+        factor=factor,        # New LR = LR * factor
+        patience=patience,    # Wait this many epochs before reducing
+        min_lr=min_lr,        # Don't go below this LR
+        verbose=True          # Print when LR is reduced
+    )
+    
+    return optimizer, scheduler
+
+
+def clip_gradients(model, max_norm=1.0):
+    """
+    Clip gradients to prevent exploding gradients
+    
+    This is especially important for RNNs/LSTMs which can have
+    gradient explosion issues during backpropagation through time
+    
+    Args:
+        model: Neural network model
+        max_norm (float): Maximum gradient norm (default: 1.0)
+    
+    Returns:
+        float: Total gradient norm before clipping
+    
+    Example:
+        >>> optimizer.zero_grad()
+        >>> loss.backward()
+        >>> grad_norm = clip_gradients(model, max_norm=1.0)
+        >>> optimizer.step()
+    """
+    total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+    return total_norm.item()
+
+
+def validate_model(model, val_loader, device, compute_next_token_loss):
+    """
+    Evaluate model on validation set
+    
+    Args:
+        model: Neural network model
+        val_loader: Validation data loader
+        device: torch device
+        compute_next_token_loss: Loss function from pico-llm.py
+    
+    Returns:
+        float: Average validation loss
+    
+    Example:
+        >>> val_loss = validate_model(model, val_loader, device, compute_next_token_loss)
+        >>> print(f"Validation loss: {val_loss:.4f}")
+    """
+    model.eval()
+    total_loss = 0.0
+    num_batches = 0
+    
+    with torch.no_grad():
+        for batch_tokens in val_loader:
+            batch_tokens = batch_tokens.to(device)
+            
+            # Forward pass
+            logits = model(batch_tokens)
+            loss = compute_next_token_loss(logits, batch_tokens)
+            
+            total_loss += loss.item()
+            num_batches += 1
+    
+    avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+    return avg_loss
+
+
+# ============================================================================
+# METRICS TRACKER
+# ============================================================================
+
+class MetricsTracker:
+    """
+    Track and visualize training metrics over epochs
+    
+    Example:
+        >>> tracker = MetricsTracker()
+        >>> for epoch in range(num_epochs):
+        >>>     # ... training code ...
+        >>>     tracker.add_epoch(epoch, train_loss, val_loss, lr)
+        >>> tracker.plot_learning_curves('my_curves.png')
+        >>> gap = tracker.get_overfitting_gap()
+    """
+    
+    def __init__(self):
+        self.train_losses = []
+        self.val_losses = []
+        self.learning_rates = []
+        self.epochs = []
+    
+    def add_epoch(self, epoch, train_loss, val_loss, lr):
+        """
+        Add metrics for one epoch
+        
+        Args:
+            epoch (int): Epoch number
+            train_loss (float): Training loss
+            val_loss (float): Validation loss
+            lr (float): Current learning rate
+        """
+        self.epochs.append(epoch)
+        self.train_losses.append(train_loss)
+        self.val_losses.append(val_loss)
+        self.learning_rates.append(lr)
+    
+    def get_overfitting_gap(self):
+        """
+        Calculate average gap between validation and training loss
+        
+        Returns:
+            float: Average (val_loss - train_loss)
+        """
+        if len(self.train_losses) == 0:
+            return 0.0
+        
+        gaps = [val - train for train, val in zip(self.train_losses, self.val_losses)]
+        return sum(gaps) / len(gaps)
+    
+    def get_final_metrics(self):
+        """
+        Get final epoch metrics
+        
+        Returns:
+            dict: Final metrics
+        """
+        if len(self.epochs) == 0:
+            return {}
+        
+        return {
+            'final_train_loss': self.train_losses[-1],
+            'final_val_loss': self.val_losses[-1],
+            'final_lr': self.learning_rates[-1],
+            'best_val_loss': min(self.val_losses),
+            'overfitting_gap': self.get_overfitting_gap()
+        }
+    
+    def plot_learning_curves(self, save_path='learning_curves.png'):
+        """
+        Plot training curves and save to file
+        
+        Creates a 2-panel figure:
+        - Left: Train vs Validation loss
+        - Right: Learning rate schedule
+        
+        Args:
+            save_path (str): Path to save the figure
+        """
+        if len(self.epochs) == 0:
+            print("No data to plot")
+            return
+        
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+        
+        # Left panel: Loss curves
+        ax1.plot(self.epochs, self.train_losses, 'b-o', 
+                label='Train Loss', linewidth=2, markersize=5, alpha=0.7)
+        ax1.plot(self.epochs, self.val_losses, 'r-o', 
+                label='Val Loss', linewidth=2, markersize=5, alpha=0.7)
+        ax1.set_xlabel('Epoch', fontsize=12)
+        ax1.set_ylabel('Loss', fontsize=12)
+        ax1.set_title('Training and Validation Loss', fontsize=14, fontweight='bold')
+        ax1.legend(fontsize=11, loc='upper right')
+        ax1.grid(alpha=0.3)
+        
+        # Add gap annotation
+        final_gap = self.val_losses[-1] - self.train_losses[-1]
+        ax1.annotate(f'Final Gap: {final_gap:.3f}',
+                    xy=(self.epochs[-1], self.val_losses[-1]),
+                    xytext=(10, 10), textcoords='offset points',
+                    bbox=dict(boxstyle='round', facecolor='yellow', alpha=0.5),
+                    fontsize=10)
+        
+        # Right panel: Learning rate
+        ax2.plot(self.epochs, self.learning_rates, 'g-o', 
+                linewidth=2, markersize=5, alpha=0.7)
+        ax2.set_xlabel('Epoch', fontsize=12)
+        ax2.set_ylabel('Learning Rate', fontsize=12)
+        ax2.set_title('Learning Rate Schedule', fontsize=14, fontweight='bold')
+        ax2.set_yscale('log')  # Log scale for LR
+        ax2.grid(alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"✓ Learning curves saved: {save_path}")
+        plt.close()
+
+
+# ============================================================================
+# ENHANCED TRAINING LOOP
+# ============================================================================
+
+def train_lstm_with_validation(
+    model, 
+    train_loader, 
+    val_loader,
+    epochs, 
+    device,
+    lr=1e-3,
+    max_grad_norm=1.0,
+    log_steps=100,
+    model_name='lstm',
+    compute_next_token_loss=None
+):
+    """
+    Train LSTM with validation, gradient clipping, and LR scheduling
+    
+    This is an enhanced version of the training loop that includes:
+    - Validation set evaluation
+    - Learning rate scheduling
+    - Gradient clipping
+    - Metrics tracking
+    
+    Args:
+        model: LSTM model to train
+        train_loader: Training data loader
+        val_loader: Validation data loader
+        epochs (int): Number of training epochs
+        device: torch device
+        lr (float): Initial learning rate (default: 1e-3)
+        max_grad_norm (float): Max gradient norm for clipping (default: 1.0)
+        log_steps (int): Print loss every N steps (default: 100)
+        model_name (str): Name for logging (default: 'lstm')
+        compute_next_token_loss: Loss function from pico-llm.py
+    
+    Returns:
+        MetricsTracker: Object containing all training metrics
+    
+    Example:
+        >>> metrics = train_lstm_with_validation(
+        ...     model, train_loader, val_loader, 
+        ...     epochs=10, device=device, 
+        ...     compute_next_token_loss=compute_next_token_loss
+        ... )
+        >>> metrics.plot_learning_curves('curves.png')
+    """
+    # Setup optimizer and scheduler
+    optimizer, scheduler = setup_optimizer_and_scheduler(model, lr=lr)
+    
+    # Metrics tracker
+    metrics = MetricsTracker()
+    
+    print(f"\n{'='*70}")
+    print(f"Training {model_name} with Validation")
+    print(f"{'='*70}")
+    print(f"Model: {sum(p.numel() for p in model.parameters())} parameters")
+    print(f"Epochs: {epochs}, LR: {lr}, Grad Clip: {max_grad_norm}")
+    print(f"{'='*70}\n")
+    
+    for epoch in range(1, epochs + 1):
+        # ====== TRAINING PHASE ======
+        model.train()
+        train_loss = 0.0
+        train_batches = 0
+        
+        for batch_idx, batch_tokens in enumerate(train_loader, start=1):
+            batch_tokens = batch_tokens.to(device)
+            
+            # Forward pass
+            logits = model(batch_tokens)
+            loss = compute_next_token_loss(logits, batch_tokens)
+            
+            # Backward pass
+            optimizer.zero_grad()
+            loss.backward()
+            
+            # Gradient clipping (prevent exploding gradients)
+            grad_norm = clip_gradients(model, max_norm=max_grad_norm)
+            
+            # Optimizer step
+            optimizer.step()
+            
+            # Track loss
+            train_loss += loss.item()
+            train_batches += 1
+            
+            # Periodic logging
+            if batch_idx % log_steps == 0:
+                avg_loss = train_loss / train_batches
+                print(f"[{model_name}] Epoch {epoch}/{epochs}, "
+                      f"Step {batch_idx}/{len(train_loader)}, "
+                      f"Loss: {avg_loss:.4f}, Grad: {grad_norm:.2f}")
+        
+        # Calculate average training loss
+        avg_train_loss = train_loss / train_batches
+        
+        # ====== VALIDATION PHASE ======
+        avg_val_loss = validate_model(model, val_loader, device, compute_next_token_loss)
+        
+        # Get current learning rate
+        current_lr = optimizer.param_groups[0]['lr']
+        
+        # Update scheduler based on validation loss
+        scheduler.step(avg_val_loss)
+        
+        # Track metrics
+        metrics.add_epoch(epoch, avg_train_loss, avg_val_loss, current_lr)
+        
+        # ====== EPOCH SUMMARY ======
+        gap = avg_val_loss - avg_train_loss
+        print(f"\n{'='*70}")
+        print(f"[{model_name}] Epoch {epoch}/{epochs} Summary:")
+        print(f"  Train Loss:      {avg_train_loss:.4f}")
+        print(f"  Val Loss:        {avg_val_loss:.4f}")
+        print(f"  Overfitting Gap: {gap:.4f} {'⚠️ HIGH' if gap > 0.3 else '✓ OK'}")
+        print(f"  Learning Rate:   {current_lr:.6f}")
+        print(f"{'='*70}\n")
+    
+    # Print final summary
+    final = metrics.get_final_metrics()
+    print(f"\n{'='*70}")
+    print(f"Training Complete - {model_name}")
+    print(f"{'='*70}")
+    print(f"Final Train Loss:     {final['final_train_loss']:.4f}")
+    print(f"Final Val Loss:       {final['final_val_loss']:.4f}")
+    print(f"Best Val Loss:        {final['best_val_loss']:.4f}")
+    print(f"Avg Overfitting Gap:  {final['overfitting_gap']:.4f}")
+    print(f"{'='*70}\n")
+    
+    return metrics
 
 
 ################################################################################
