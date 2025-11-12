@@ -469,7 +469,75 @@ def plot_attention_heatmap(attn_matrix, title="Attention", savepath=None):
 ################################################################################
 
 def nucleus_sampling(logits, p=0.95):
-    return torch.argmax(logits).item()
+    """
+    Top-p (nucleus) sampling.
+
+    Args:
+        logits: (vocab_size,) unnormalized logits
+        p: cumulative probability threshold
+
+    Returns:
+        token_id: int
+    """
+    # Convert logits to probabilities using softmax
+    probs = F.softmax(logits, dim=-1)
+
+    # Sort probabilities in descending order and get corresponding indices
+    sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+
+    # Compute cumulative sum of sorted probabilities
+    cumsum_probs = torch.cumsum(sorted_probs, dim=-1)
+
+    # Find where cumulative probability exceeds threshold p
+    cutoff_idx = torch.where(cumsum_probs >= p)[0]
+    if len(cutoff_idx) > 0:
+        # Take first index that exceeds p, add 1 to include it
+        cutoff_idx = cutoff_idx[0].item() + 1
+    else:
+        # If no cutoff found, use all tokens
+        cutoff_idx = len(sorted_probs)
+
+    # Keep only top-p tokens (nucleus)
+    top_probs = sorted_probs[:cutoff_idx]
+    top_indices = sorted_indices[:cutoff_idx]
+
+    # Renormalize probabilities to sum to 1
+    top_probs = top_probs / top_probs.sum()
+
+    # Sample from the nucleus according to renormalized probabilities
+    sampled_idx = torch.multinomial(top_probs, num_samples=1).item()
+
+    # Get the actual token ID from original vocabulary
+    token_id = top_indices[sampled_idx].item()
+
+    return token_id
+
+
+def temperature_sampling(logits, temperature=1.0):
+    """Temperature sampling - scale logits before softmax"""
+    # Scale logits by temperature (higher temp = more random, lower temp = more deterministic)
+    scaled_logits = logits / temperature
+
+    # Convert scaled logits to probabilities
+    probs = F.softmax(scaled_logits, dim=-1)
+
+    # Sample one token from the probability distribution
+    return torch.multinomial(probs, num_samples=1).item()
+
+
+def top_k_sampling(logits, k=50):
+    """Top-k sampling - sample from top k tokens"""
+    # Get top k logits and their indices
+    top_logits, top_indices = torch.topk(logits, k)
+
+    # Convert top k logits to probabilities
+    probs = F.softmax(top_logits, dim=-1)
+
+    # Sample from top k according to their probabilities
+    sampled_idx = torch.multinomial(probs, num_samples=1).item()
+
+    # Return the actual token ID from original vocabulary
+    return top_indices[sampled_idx].item()
 
 
 def generate_text(model, enc, init_text, max_new_tokens=20, device="cpu",
