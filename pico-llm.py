@@ -656,13 +656,98 @@ def train_lstm_with_validation(
 class RMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-5):
         super().__init__()
-        pass
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x32 = x.to(torch.float32)
+        inv_rms = torch.rsqrt(x32.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        y = (x32 * inv_rms).to(x.dtype)
+        return y * self.weight
+
+class MultiHeadSelfAttention(nn.Module):
+    def __init__(self, d_model: int, n_heads: int):
+        super().__init__()
+        assert d_model % n_heads == 0
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        T, B, D = x.shape
+
+        q = self.q_proj(x).view(T, B, self.n_heads, self.d_head).permute(1, 2, 0, 3)
+        k = self.k_proj(x).view(T, B, self.n_heads, self.d_head).permute(1, 2, 0, 3)
+        v = self.v_proj(x).view(T, B, self.n_heads, self.d_head).permute(1, 2, 0, 3)
+
+        scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.d_head)
+
+        mask = torch.triu(torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1)
+        scores = scores.masked_fill(mask, float("-inf"))
+
+        attn = F.softmax(scores, dim=-1)
+        out = attn @ v                                      
+
+        out = out.permute(2, 0, 1, 3).contiguous().view(T, B, D)
+        return self.out_proj(out)
+
+class TransformerBlock(nn.Module):
+    def __init__(self, d_model: int, n_heads: int, mlp_ratio: float = 4.0):
+        super().__init__()
+        self.attn_norm = RMSNorm(d_model)
+        self.mlp_norm  = RMSNorm(d_model)
+        self.attn = MultiHeadSelfAttention(d_model, n_heads)
+
+        hidden = int(d_model * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, d_model),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn(self.attn_norm(x))
+        x = x + self.mlp(self.mlp_norm(x))
+        return x
 
 class TransformerModel(nn.Module):
-    def __init__(self, vocab_size=50257, d_model=1024, n_heads=2, n_blocks=4):
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        mlp_ratio: float = 4.0,
+        *,
+        vocab_size: int = 50257,
+        max_seq_len: int = 1024,
+        n_blocks: int = 4,
+    ):
         super().__init__()
+        self.token_embedding = nn.Embedding(vocab_size, d_model)
+        self.pos_embedding   = nn.Embedding(max_seq_len, d_model)
+        self.blocks = nn.ModuleList(
+            [TransformerBlock(d_model, n_heads, mlp_ratio=mlp_ratio) for _ in range(n_blocks)]
+        )
+        self.final_norm = RMSNorm(d_model)
+        self.lm_head    = nn.Linear(d_model, vocab_size)
 
-        pass
+    def forward(self, x: torch.LongTensor) -> torch.Tensor:
+        T, B = x.shape
+        device = x.device
+
+        tok = self.token_embedding(x) 
+        pos_ids = torch.arange(T, device=device).unsqueeze(1).expand(T, B)
+        pos = self.pos_embedding(pos_ids)
+
+        h = tok + pos
+        for blk in self.blocks:
+            h = blk(h)
+
+        h = self.final_norm(h)
+        return self.lm_head(h) 
+
 
 
 ################################################################################
@@ -1229,12 +1314,17 @@ def main():
     ).to(device)
 
     transformer = TransformerModel(
-    ).to(device)
+    d_model=embed_size, n_heads=4, mlp_ratio=4.0,
+    vocab_size=vocab_size, max_seq_len=block_size, n_blocks=4
+).to(device)
+
+
 
     models = {
       # "kgram_mlp_seq": kgram_model,
         "lstm_seq": lstm_model,
       # "kvcache_transformer": kv_transformer,
+      "transformer_seq": transformer,
     }
 
 
