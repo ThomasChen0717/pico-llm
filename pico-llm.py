@@ -160,10 +160,23 @@ class KGramMLPSeqModel(nn.Module):
         self.embed_size = embed_size
         self.num_inner_layers = num_inner_layers
         self.chunk_size = chunk_size
-
-        # fill in
-
-        self.net = None
+        # Token embedding to avoid materializing giant one-hots
+        self.token_embed = nn.Embedding(self.vocab_size, self.embed_size)
+        # Build a simple MLP that maps flattened embedded k-gram to next-token logits.
+        # Input dimension = k * embed_size, output dimension = vocab_size.
+        layers = []
+        input_dim = self.k * self.embed_size
+        hidden_dim = self.embed_size
+        # First projection + activation
+        layers.append(nn.Linear(input_dim, hidden_dim))
+        layers.append(nn.SiLU())
+        # Additional (Linear -> SiLU) inner layers
+        for _ in range(max(0, self.num_inner_layers - 1)):
+            layers.append(nn.Linear(hidden_dim, hidden_dim))
+            layers.append(nn.SiLU())
+        # Final projection to vocab logits
+        layers.append(nn.Linear(hidden_dim, self.vocab_size))
+        self.net = nn.Sequential(*layers)
 
     def forward(self, tokens_seq):
         """
@@ -187,11 +200,9 @@ class KGramMLPSeqModel(nn.Module):
                     else:
                         context_ids = tokens_seq[t-self.k:t, b].tolist()
 
-                    context_oh = F.one_hot(
-                        torch.tensor(context_ids, dtype=torch.long, device=tokens_seq.device),
-                        num_classes=self.vocab_size
-                    )
-                    context_flat = context_oh.flatten().float().unsqueeze(0)
+                    ids_tensor = torch.tensor(context_ids, dtype=torch.long, device=tokens_seq.device)
+                    # (k, embed_size) -> flatten to (1, k*embed_size)
+                    context_flat = self.token_embed(ids_tensor).flatten().unsqueeze(0)
                     logits_b = self.net(context_flat)  # (1, vocab_size)
                     batch_logits.append(logits_b)
                 block_outputs.append(torch.cat(batch_logits, dim=0).unsqueeze(0))  # (1, batch, vocab_size)
@@ -1321,10 +1332,10 @@ def main():
 
 
     models = {
-      # "kgram_mlp_seq": kgram_model,
+        "kgram_mlp_seq": kgram_model,
         "lstm_seq": lstm_model,
       # "kvcache_transformer": kv_transformer,
-      "transformer_seq": transformer,
+        "transformer_seq": transformer,
     }
 
 
