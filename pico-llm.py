@@ -1,5 +1,6 @@
 # starter code by matus & o1-pro
 import argparse
+import os
 import time
 import random
 import math
@@ -9,10 +10,12 @@ import torch.optim as optim
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 
+
 # We do not import numpy or scikit-learn, so we implement a naive k-means in pure PyTorch.
 # If you prefer scikit-learn, you can adapt the code.
 
 from datasets import load_dataset
+from torch.utils.data import random_split
 import tiktoken
 
 ################################################################################
@@ -32,6 +35,11 @@ def parse_args():
     parser.add_argument("--monosemantic_enabled", action="store_true",
                         help="(DISABLED BY DEFAULT) If set, run the monosemantic analysis.")
     parser.set_defaults(monosemantic_enabled=False)  # disable by default
+
+    parser.add_argument("--compare_models", action="store_true",
+                        help="If set, compute loss/perplexity for each model and save a bar chart.")
+    parser.add_argument("--dump_attn", action="store_true",
+                        help="If set, dump Transformer attention heatmap to imgs/transformer_seq_attn.png.")
 
     # Additional hyperparams to mitigate slow k-gram
     parser.add_argument("--kgram_k", type=int, default=3,
@@ -854,14 +862,18 @@ def visualize_embeddings(model, sample_token_ids=None, max_points=800, title="Em
     Projects token embeddings to 2D with PCA (torch-only) and returns (coords_2d, used_token_ids).
     If matplotlib is available in your env, you can also scatter-plot and save.
     """
+    #Get the embedding weight matrix
     W = _get_token_embedding_weight(model)
+     #Failsafe: if the model has no embedding, return None, None
     if W is None:
         print("[viz] No embedding found on this model.")
         return None, None
-
+    #Move the embedding matrix to the correct device
     W = W.to(device)
+    #Get the vocabulary size
     vocab_size = W.size(0)
 
+    #If no sample_token_ids are provided, use a random subset of the vocabulary
     if sample_token_ids is None:
         if vocab_size > max_points:
             idx = torch.randperm(vocab_size, device=device)[:max_points]
@@ -874,17 +886,24 @@ def visualize_embeddings(model, sample_token_ids=None, max_points=800, title="Em
             print("[viz] Provided sample_token_ids are empty/invalid.")
             return None, None
 
+    #Get the embeddings for the selected token IDs
     X = W[idx]  
-    
+    #Center the embeddings around the origin
     Xc = X - X.mean(dim=0, keepdim=True)
-
+    #Compute the SVD of the centered embeddings
     U, S, Vh = torch.linalg.svd(Xc, full_matrices=False)
+    #Project the embeddings onto the first two principal components
     Z = U[:, :2] * S[:2]  
 
+    #Try to plot the embeddings if matplotlib is available
     try:
         import matplotlib.pyplot as plt
         plt.figure()
-        plt.scatter(Z[:, 0].cpu(), Z[:, 1].cpu(), s=4)
+        plt.scatter(
+            Z[:, 0].detach().cpu().numpy(),
+            Z[:, 1].detach().cpu().numpy(),
+            s=4
+        )
         plt.title(title)
         plt.xlabel("PC1")
         plt.ylabel("PC2")
@@ -895,25 +914,37 @@ def visualize_embeddings(model, sample_token_ids=None, max_points=800, title="Em
     except Exception as e:
         print(f"[viz] Skipped plotting ({e})")
 
+    #Return the 2D embeddings and the used token IDs
     return Z.detach().cpu(), idx.detach().cpu().tolist()
 
 def count_parameters(model):
+    """Count trainable parameters in a model."""
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 @torch.no_grad()
 def evaluate_loss_and_ppl(model, loader, device):
+    """Evaluate model loss and perplexity on a dataset."""
+    #Set model to evaluation mode (disables dropout, etc.)
     model.eval()
+    # Initialize counters for loss and batches
     total_loss = 0.0
     total_batches = 0
+    #Loop through all batches in the dataset
     for batch_tokens in loader:
+        #Move batch to correct device (CPU or GPU)
         batch_tokens = batch_tokens.to(device)
+        #Forward pass: get model predictions
         logits = model(batch_tokens)
+        #Compute cross-entropy loss for next token prediction
         loss = compute_next_token_loss(logits, batch_tokens)
+        #Accumulate weighted loss
         total_loss += loss.item()
         total_batches += 1
         if total_batches >= 50:   # cap for speed; tweak as needed
             break
+    #Compute average loss per token
     avg_loss = total_loss / max(total_batches, 1)
+    #Compute perplexity as exp(average loss)
     ppl = math.exp(avg_loss) if avg_loss < 20 else float("inf")
     return avg_loss, ppl
 
@@ -921,19 +952,25 @@ def compare_models(models_dict, loader, device, title="Model Comparison", savepa
     """
     Returns a summary dict and saves a bar chart of perplexities.
     """
+    #Initialize a dictionary to store model summaries
     summary = {}
     names, ppls = [], []
     for name, model in models_dict.items():
+        #Evaluate model loss and perplexity on the dataset
         avg_loss, ppl = evaluate_loss_and_ppl(model, loader, device)
+        #Count trainable parameters in the model
         n_params = count_parameters(model)
+        #Store the evaluation results and parameter count in the summary dictionary
         summary[name] = {
             "avg_loss": avg_loss,
             "perplexity": ppl,
             "params": n_params,
         }
+        #Add the model name and perplexity to the respective lists for plotting
         names.append(name)
         ppls.append(ppl)
-
+    
+    #Try to plot the perplexities if matplotlib is available
     try:
         import matplotlib.pyplot as plt
         plt.figure()
@@ -948,6 +985,7 @@ def compare_models(models_dict, loader, device, title="Model Comparison", savepa
     except Exception as e:
         print(f"[compare] Skipped plotting ({e})")
 
+    # Print a summary table of model performance
     print("\n=== Model Comparison ===")
     for k, v in summary.items():
         print(f"{k:>16} | loss={v['avg_loss']:.4f} | ppl={v['perplexity']:.2f} | params={v['params']:,}")
@@ -959,6 +997,10 @@ def plot_attention_heatmap(attn_matrix, title="Attention", savepath=None):
     """
     attn_matrix: (T, T) or (H, T, T) torch tensor
     """
+    #Check if the attention matrix has the correct shape
+    if attn_matrix.dim() not in [2, 3]:
+        raise ValueError("attn_matrix must be (T, T) or (H, T, T)")
+    #Try to plot the attention heatmap if matplotlib is available
     try:
         import matplotlib.pyplot as plt
         A = attn_matrix.detach().float().cpu()
@@ -976,6 +1018,32 @@ def plot_attention_heatmap(attn_matrix, title="Attention", savepath=None):
         plt.close()
     except Exception as e:
         print(f"[attn] Skipped plotting ({e})")
+
+def dump_transformer_attention(transformer, loader, device, savepath="imgs/transformer_attn.png"):
+    transformer.eval()
+    with torch.no_grad():
+        batch_tokens = next(iter(loader)).to(device)   # (T,B)
+        T, B = batch_tokens.shape
+
+        # Get the first block's attention module
+        att_layer = transformer.blocks[0].attn
+
+        # Embed only; we don't need to run full forward
+        x = transformer.token_embedding(batch_tokens)  # (T,B,D)
+
+        # Recompute attention scores like in MultiHeadSelfAttention.forward
+        q = att_layer.q_proj(x).view(T, B, att_layer.n_heads, att_layer.d_head).permute(1, 2, 0, 3)
+        k = att_layer.k_proj(x).view(T, B, att_layer.n_heads, att_layer.d_head).permute(1, 2, 0, 3)
+        scores = (q @ k.transpose(-2, -1)) / math.sqrt(att_layer.d_head)
+        mask = torch.triu(torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1)
+        scores = scores.masked_fill(mask, float("-inf"))
+        attn = F.softmax(scores, dim=-1)  # (B,H,T,T)
+
+        # Take batch 0 -> shape (H,T,T)
+        attn_matrix = attn[0]
+        os.makedirs("imgs", exist_ok=True)
+        plot_attention_heatmap(attn_matrix, title="Transformer First Block Attention", savepath=savepath)
+        print(f"[transformer_seq] Saved attention heatmap to {savepath}")
 
 
 ################################################################################
@@ -1229,7 +1297,7 @@ def main():
     learning_rate = 1e-3
 
     block_size = args.block_size
-    train_subset_size = 20000
+    train_subset_size = 5000
     log_interval_steps = 100
     sample_interval_seconds = 30
 
@@ -1398,6 +1466,69 @@ def main():
         print(text_topp1)
         print(f"Annotated:\n{ann_topp1}")
         print("--------------------------------------------------")
+    
+
+    # --------------------------------------------------
+    # Monosemantic / embedding visualizations for REAL model
+    # --------------------------------------------------
+    if args.monosemantic_enabled:
+        os.makedirs("imgs", exist_ok=True)
+        for model_name, model in models.items():
+            # 1) PCA of token embeddings
+            pca_path = f"imgs/{model_name}_embedding_pca.png"
+            visualize_embeddings(
+                model,
+                max_points=500,  # or smaller if you want
+                title=f"{model_name} Embedding PCA",
+                savepath=pca_path,
+                device=device
+            )
+            print(f"[{model_name}] Saved embedding PCA to {pca_path}")
+
+            # 2) Nearest neighbors for a few interesting token IDs
+            # e.g., first few IDs, or ids for '.', 'the', etc. if you want to decode them
+            sample_token_ids = [0, 1, 2, 3, 4, 5]
+            for tid in sample_token_ids:
+                neighs = monosemantic_analysis_for_token(
+                    tid, model, device=device, top_n=5
+                )
+                tok = enc.decode([tid])
+                print(f"[{model_name}] token_id={tid} token='{tok}' neighbors:")
+                for sim, idx in neighs:
+                    nneigh = enc.decode([idx])
+                    print(f"  -> id={idx}, token='{nneigh}', sim={sim:.3f}")    
+            print("--------------------------------------------------")
+
+    # --------------------------------------------------
+    # Optional: perplexity comparison over trained models
+    # --------------------------------------------------
+    if args.compare_models:
+        os.makedirs("imgs", exist_ok=True)
+        print("\nRunning perplexity comparison on trained models...")
+        comparison_path = "imgs/trained_models_ppl.png"
+        compare_models(
+            models,        # dict of name -> model
+            train_loader,  # or a held-out loader if you prefer
+            device,
+            title="Trained Models Comparison",
+            savepath=comparison_path
+        )
+        print(f"Saved perplexity comparison chart to {comparison_path}")
+
+    # --------------------------------------------------
+    # Optional: Transformer attention heatmap
+    # --------------------------------------------------
+    if args.dump_attn:
+        os.makedirs("imgs", exist_ok=True)
+        print("\nDumping Transformer attention heatmap...")
+        dump_transformer_attention(
+            transformer,
+            train_loader,  # or val_loader if you later make one
+            device,
+            savepath="imgs/transformer_seq_attn.png"
+        )
+
+
 
     # Finally, let's share how I'm feeling:
     print("\n*** I'm feeling great today! Hope you're well, too. ***")
